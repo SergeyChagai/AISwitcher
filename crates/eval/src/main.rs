@@ -35,9 +35,104 @@ struct Tier0 {
     margin: f64,
 }
 
+/// Во сколько раз ослабляется порог, если соседний токен уверенно переключён.
+///
+/// Раскладку забывают не на одно слово: если сосед уже опознан как набранный не в
+/// той раскладке, текущий токен почти наверняка из той же серии. Это единственный
+/// контекстный признак, который не требует ни модели, ни словаря.
+const NEIGHBOUR_RELIEF: f64 = 0.3;
+
+/// Ширина зоны неуверенности вокруг порога. Решение внутри неё Tier 0 не принимает
+/// сам, а поднимает на Tier 1 (ADR-0001).
+/// Значение выбрано по кривой «цена против охвата» (см. вывод программы):
+/// на 2.0 модели становятся доступны 11 ошибок из 12 ценой 22% поднятых решений.
+/// Более узкая полоса дешевле, но отдаёт наверх меньше половины ошибок, то есть
+/// делает Tier 1 бессмысленным.
+const ESCALATION_BAND: f64 = 2.0;
+
+/// Разбор одного токена без принятия решения: отрыв гипотез и признаки,
+/// по которым решается, годится ли этот токен для n-граммной статистики вообще.
+struct Analysis {
+    /// Насколько альтернатива лучше исходной гипотезы. Отрицательное — хуже.
+    diff: f64,
+    /// Порог, который требуется превысить.
+    required: f64,
+    /// Токен непригоден для n-граммной оценки: аббревиатура или слишком короткий.
+    unreliable: bool,
+    /// Токен вообще не поддаётся анализу (цифры, смешанный алфавит).
+    inert: bool,
+}
+
+impl Analysis {
+    fn decision(&self) -> Decision {
+        if !self.inert && self.diff > self.required {
+            Decision::Switch
+        } else {
+            Decision::Keep
+        }
+    }
+
+    /// Решение не принимается на Tier 0: либо отрыв в зоне неуверенности, либо
+    /// статистика к токену неприменима.
+    ///
+    /// Ненадёжность токена сама по себе поводом не является. Русский текст состоит
+    /// из коротких слов («не», «на», «что»), и правило «длина ≤3 → наверх» отправляло
+    /// бы на Tier 1 треть всех решений. Поэтому ненадёжный токен поднимается только
+    /// тогда, когда альтернатива не отвергнута уверенно.
+    fn escalates(&self) -> bool {
+        self.escalates_with_band(ESCALATION_BAND)
+    }
+
+    fn escalates_with_band(&self, band: f64) -> bool {
+        if self.inert {
+            return false;
+        }
+        if self.unreliable {
+            return self.diff > -band;
+        }
+        (self.diff - self.required).abs() < band
+    }
+}
+
 impl Tier0 {
     fn decide(&self, token: &str) -> Decision {
         self.decide_with_margin(token, self.margin)
+    }
+
+    fn analyze(&self, token: &str, margin: f64) -> Analysis {
+        let inert = Analysis {
+            diff: 0.0,
+            required: margin,
+            unreliable: false,
+            inert: true,
+        };
+
+        let dir = match detect_direction(token) {
+            Some(d) => d,
+            None => return inert,
+        };
+        let alt = match transliterate(token, dir) {
+            Some(a) => a,
+            None => return inert,
+        };
+
+        let (as_typed, as_alt) = match dir {
+            Direction::EnToRu => (self.en.score(token), self.ru.score(&alt)),
+            Direction::RuToEn => (self.ru.score(token), self.en.score(&alt)),
+        };
+
+        let len = token.chars().count();
+        let all_caps = token.chars().any(|c| c.is_alphabetic())
+            && token.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase());
+
+        Analysis {
+            diff: as_alt - as_typed,
+            required: if len < SHORT_TOKEN_LEN { margin * 2.0 } else { margin },
+            // Аббревиатура не подчиняется буквосочетаемости языка, а у совсем
+            // коротких токенов статистики просто нет.
+            unreliable: all_caps || len <= 3,
+            inert: false,
+        }
     }
 
     fn decide_with_margin(&self, token: &str, margin: f64) -> Decision {
@@ -203,13 +298,13 @@ fn split(tokens: &[String]) -> (Vec<String>, Vec<String>) {
 /// Здесь Tier 0 намеренно оценивается вне контекста — он контекста и не видит.
 /// Смысл замера в том, чтобы показать, сколько именно он теряет там, где решение
 /// без окружения невозможно: это и есть бюджет, который может отыграть Tier 1.
-fn read_context_cases(path: &Path) -> Vec<(String, String, Decision)> {
+fn read_context_cases(path: &Path) -> Vec<Sentence> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(_) => return Vec::new(),
     };
 
-    let mut cases = Vec::new();
+    let mut cases: Vec<Sentence> = Vec::new();
     let mut family = String::from("(без семейства)");
 
     for line in text.lines() {
@@ -231,16 +326,27 @@ fn read_context_cases(path: &Path) -> Vec<(String, String, Decision)> {
             continue;
         }
 
-        for raw in trimmed.split_whitespace() {
-            match raw.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
-                Some(token) => {
-                    cases.push((family.clone(), token.to_string(), Decision::Switch))
-                }
-                None => cases.push((family.clone(), raw.to_string(), Decision::Keep)),
-            }
-        }
+        let tokens = trimmed
+            .split_whitespace()
+            .map(|raw| match raw.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+                Some(token) => (token.to_string(), Decision::Switch),
+                None => (raw.to_string(), Decision::Keep),
+            })
+            .collect();
+
+        cases.push(Sentence {
+            family: family.clone(),
+            tokens,
+        });
     }
     cases
+}
+
+/// Предложение контекстного подкорпуса: токены хранятся вместе, потому что
+/// признаку соседства нужны соседи.
+struct Sentence {
+    family: String,
+    tokens: Vec<(String, Decision)>,
 }
 
 fn percentile(sorted_nanos: &[u128], p: f64) -> u128 {
@@ -392,28 +498,93 @@ fn main() {
     if !context_cases.is_empty() {
         let mut per_family: HashMap<String, Counts> = HashMap::new();
         let mut ctx_overall = Counts::default();
-        let mut ctx_errors: Vec<(&str, &str, Decision)> = Vec::new();
+        let mut ctx_errors: Vec<(String, String, Decision)> = Vec::new();
+        let mut escalated = 0usize;
+        let mut total_tokens = 0usize;
+        let mut neighbour_fixed: Vec<String> = Vec::new();
+        // Ключевая диагностика правила эскалации: ошибка, не поднятая наверх,
+        // недостижима для Tier 1 в принципе.
+        let mut errors_escalated = 0usize;
 
-        for (family, token, expected) in &context_cases {
-            let got = tier0.decide(token);
-            ctx_overall.record(*expected, got);
-            per_family
-                .entry(family.clone())
-                .or_default()
-                .record(*expected, got);
-            if got != *expected {
-                ctx_errors.push((family, token, *expected));
+        for sentence in &context_cases {
+            // Проход 1: Tier 0 сам по себе.
+            let analyses: Vec<Analysis> = sentence
+                .tokens
+                .iter()
+                .map(|(t, _)| tier0.analyze(t, tier0.margin))
+                .collect();
+            let base: Vec<Decision> = analyses.iter().map(|a| a.decision()).collect();
+
+            // Проход 2: признак соседства. Порог ослабляется, если соседний токен
+            // уверенно переключён и сам при этом не поднимался на Tier 1.
+            for (i, (token, expected)) in sentence.tokens.iter().enumerate() {
+                total_tokens += 1;
+                let a = &analyses[i];
+                if a.escalates() {
+                    escalated += 1;
+                }
+
+                let neighbour_switched = [i.checked_sub(1), i.checked_add(1)]
+                    .into_iter()
+                    .flatten()
+                    .any(|j| {
+                        j < base.len()
+                            && base[j] == Decision::Switch
+                            && !analyses[j].escalates()
+                    });
+
+                let got = if !a.inert && neighbour_switched && a.diff > a.required * NEIGHBOUR_RELIEF
+                {
+                    Decision::Switch
+                } else {
+                    base[i]
+                };
+
+                if got != base[i] && got == *expected {
+                    neighbour_fixed.push(token.clone());
+                }
+
+                ctx_overall.record(*expected, got);
+                per_family
+                    .entry(sentence.family.clone())
+                    .or_default()
+                    .record(*expected, got);
+                if got != *expected {
+                    ctx_errors.push((sentence.family.clone(), token.clone(), *expected));
+                    if a.escalates() {
+                        errors_escalated += 1;
+                    }
+                }
             }
         }
 
         println!("## Контекстный подкорпус\n");
         println!(
-            "{} токенов, precision {:.4}, recall {:.4}, FP {}, FN {}\n",
+            "{} токенов, precision {:.4}, recall {:.4}, FP {}, FN {}",
             ctx_overall.total(),
             ctx_overall.precision(),
             ctx_overall.recall(),
             ctx_overall.fp,
             ctx_overall.fn_
+        );
+        println!(
+            "Поднято на Tier 1: {} из {} ({:.1}%)",
+            escalated,
+            total_tokens,
+            100.0 * escalated as f64 / total_tokens as f64
+        );
+        println!(
+            "Ошибок внутри поднятого множества: {} из {}",
+            errors_escalated,
+            ctx_errors.len()
+        );
+        println!(
+            "Исправлено признаком соседства: {}\n",
+            if neighbour_fixed.is_empty() {
+                "нет".to_string()
+            } else {
+                neighbour_fixed.join(", ")
+            }
         );
 
         println!("| Семейство | Токенов | FP | FN | Доля верных |");
@@ -429,6 +600,46 @@ fn main() {
 
         // Список ошибок печатается целиком: их немного, и каждая — конкретный
         // случай, который должен либо чиниться, либо осознанно приниматься.
+        // Главный компромисс правила эскалации: чем шире полоса, тем больше ошибок
+        // доступно Tier 1 — и тем чаще вызывается модель. Одной точкой это не
+        // описывается, поэтому печатается кривая.
+        println!("Цена эскалации против охвата ошибок:\n");
+        println!("| band | Поднято | Доля | Ошибок доступно |");
+        println!("|---|---|---|---|");
+        // Знаменатель — ошибки чистого Tier 0, до признака соседства: именно их
+        // могла бы забрать модель.
+        let base_errors: usize = context_cases
+            .iter()
+            .flat_map(|s| s.tokens.iter())
+            .filter(|(t, e)| tier0.analyze(t, tier0.margin).decision() != *e)
+            .count();
+
+        for band in [0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0] {
+            let mut up = 0usize;
+            let mut covered = 0usize;
+            for sentence in &context_cases {
+                for (token, expected) in &sentence.tokens {
+                    let a = tier0.analyze(token, tier0.margin);
+                    let esc = a.escalates_with_band(band);
+                    if esc {
+                        up += 1;
+                    }
+                    if a.decision() != *expected && esc {
+                        covered += 1;
+                    }
+                }
+            }
+            println!(
+                "| {:.2} | {} | {:.1}% | {} из {} |",
+                band,
+                up,
+                100.0 * up as f64 / total_tokens as f64,
+                covered,
+                base_errors
+            );
+        }
+        println!();
+
         println!("Ошибки ({}):\n", ctx_errors.len());
         for (family, token, expected) in &ctx_errors {
             let what = match expected {
