@@ -1,0 +1,6 @@
+# Local Meronq data
+.meronq/
+!.meronq/config.json
+
+node_modules/
+dist/

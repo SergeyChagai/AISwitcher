@@ -1,0 +1,7 @@
+{
+  "name": "aiswitcher",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Context-aware keyboard layout switcher (RU/EN) with a two-tier detection pipeline: deterministic scorer first, model only on low confidence.",
+  "license": "Apache-2.0"
+}
