@@ -640,6 +640,29 @@ fn main() {
         }
         println!();
 
+        // Поведение продукта до появления Tier 1: раз решение поднято наверх, а
+        // наверху пусто — действие по умолчанию не переключать (ADR-0001).
+        // Это не вариант настройки, а проверка того, что принцип соблюдается.
+        let mut deferred = Counts::default();
+        for sentence in &context_cases {
+            for (token, expected) in &sentence.tokens {
+                let a = tier0.analyze(token, tier0.margin);
+                let got = if a.escalates() {
+                    Decision::Keep
+                } else {
+                    a.decision()
+                };
+                deferred.record(*expected, got);
+            }
+        }
+        println!(
+            "Если поднятое наверх не переключать: precision {:.4}, recall {:.4}, FP {}, FN {}\n",
+            deferred.precision(),
+            deferred.recall(),
+            deferred.fp,
+            deferred.fn_
+        );
+
         println!("Ошибки ({}):\n", ctx_errors.len());
         for (family, token, expected) in &ctx_errors {
             let what = match expected {
