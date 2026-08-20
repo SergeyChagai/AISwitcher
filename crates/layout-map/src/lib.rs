@@ -109,6 +109,31 @@ mod tests {
         assert_eq!(transliterate(&ru, Direction::RuToEn).unwrap(), token);
     }
 
+    /// Пары, где обе интерпретации осмысленны: латинский токен встречается в
+    /// техническом тексте, а его кириллический двойник — настоящее русское слово.
+    /// Ровно на них Tier 0 не может решить без контекста, поэтому список
+    /// зафиксирован тестом: он используется в `corpus/context/sentences.txt`.
+    #[test]
+    fn ambiguous_pairs_are_what_we_claim() {
+        let pairs = [
+            ("vs", "мы"),
+            ("ns", "ты"),
+            ("he", "ру"),
+            ("ds", "вы"),
+            ("z", "я"),
+            ("b", "и"),
+            ("d", "в"),
+            ("c", "с"),
+        ];
+        for (en, ru) in pairs {
+            assert_eq!(
+                transliterate(en, Direction::EnToRu).as_deref(),
+                Some(ru),
+                "пара {en} / {ru} заявлена неверно"
+            );
+        }
+    }
+
     #[test]
     fn digits_are_not_mapped() {
         assert_eq!(transliterate("test1", Direction::EnToRu), None);
