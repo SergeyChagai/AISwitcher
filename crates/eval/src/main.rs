@@ -12,6 +12,12 @@ use std::time::Instant;
 use layout_map::{detect_direction, transliterate, Direction};
 use ngram::CharNgram;
 
+mod register;
+use register::RegisterModel;
+
+/// Вес признака регистра текста при вызове Tier 1. Подбирается развёрткой.
+const REGISTER_WEIGHT: f64 = 1.0;
+
 /// Порог: на сколько альтернатива должна опережать исходную гипотезу, чтобы
 /// переключение состоялось. Смещён в сторону молчания (ADR-0001).
 ///
@@ -662,6 +668,115 @@ fn main() {
             deferred.fp,
             deferred.fn_
         );
+
+        // --- Кандидат Tier 1 №1: регистр текста ---
+        //
+        // Вызывается только на поднятых решениях. Технический контекст сдвигает выбор
+        // в сторону латинского чтения токена, бытовой — в сторону русского.
+        let register = RegisterModel::new(&ru_train, &speech_train);
+
+        println!("## Кандидат Tier 1: регистр текста\n");
+        let (tech_vocab, common_vocab) = register.vocab_sizes();
+        println!(
+            "Словари: технический русский {} слов, бытовой {} слов",
+            tech_vocab, common_vocab
+        );
+
+        // Покрытие считается один раз: оно не зависит от веса.
+        let (mut known, mut seen_words) = (0usize, 0usize);
+        for sentence in &context_cases {
+            let analyses: Vec<Analysis> = sentence
+                .tokens
+                .iter()
+                .map(|(t, _)| tier0.analyze(t, tier0.margin))
+                .collect();
+            for i in 0..sentence.tokens.len() {
+                if !analyses[i].escalates() {
+                    continue;
+                }
+                let context: Vec<String> = sentence
+                    .tokens
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i && !analyses[*j].escalates())
+                    .map(|(_, (t, _))| t.to_lowercase())
+                    .filter(|t| t.chars().all(layout_map::is_cyrillic))
+                    .collect();
+                let (k, n) = register.coverage(&context);
+                known += k;
+                seen_words += n;
+            }
+        }
+        println!(
+            "Покрытие контекста: {} известных слов из {} ({:.1}%)\n",
+            known,
+            seen_words,
+            100.0 * known as f64 / seen_words.max(1) as f64
+        );
+
+        println!("| вес | Precision | Recall | FP | FN | Вызовов признака |");
+        println!("|---|---|---|---|---|---|");
+
+        for weight in [0.0, 0.25, 0.5, 1.0, 2.0, 4.0] {
+            let mut c = Counts::default();
+            let mut used = 0usize;
+            for sentence in &context_cases {
+                let analyses: Vec<Analysis> = sentence
+                    .tokens
+                    .iter()
+                    .map(|(t, _)| tier0.analyze(t, tier0.margin))
+                    .collect();
+
+                for (i, (token, expected)) in sentence.tokens.iter().enumerate() {
+                    let a = &analyses[i];
+                    if !a.escalates() {
+                        c.record(*expected, a.decision());
+                        continue;
+                    }
+
+                    // Контекст — соседние кириллические токены, решение по которым
+                    // Tier 0 принял уверенно. Сам оцениваемый токен исключён.
+                    let context: Vec<String> = sentence
+                        .tokens
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != i && !analyses[*j].escalates())
+                        .map(|(_, (t, _))| t.to_lowercase())
+                        .filter(|t| t.chars().all(layout_map::is_cyrillic))
+                        .collect();
+
+                    let got = match register.context_score(&context) {
+                        Some(ctx) => {
+                            used += 1;
+                            // Технический контекст (ctx > 0) удешевляет переключение
+                            // кириллицы в латиницу и удорожает обратное.
+                            let shift = match detect_direction(token) {
+                                Some(Direction::RuToEn) => -ctx * weight,
+                                Some(Direction::EnToRu) => ctx * weight,
+                                None => 0.0,
+                            };
+                            if a.diff > a.required + shift {
+                                Decision::Switch
+                            } else {
+                                Decision::Keep
+                            }
+                        }
+                        None => a.decision(),
+                    };
+                    c.record(*expected, got);
+                }
+            }
+            println!(
+                "| {:.2} | {:.4} | {:.4} | {} | {} | {} |",
+                weight,
+                c.precision(),
+                c.recall(),
+                c.fp,
+                c.fn_,
+                used
+            );
+        }
+        println!();
 
         println!("Ошибки ({}):\n", ctx_errors.len());
         for (family, token, expected) in &ctx_errors {
