@@ -195,6 +195,54 @@ fn split(tokens: &[String]) -> (Vec<String>, Vec<String>) {
     (train, test)
 }
 
+/// Разбор контекстного подкорпуса `corpus/context/cases.txt`.
+///
+/// Возвращает случаи, сгруппированные по семейству: `(семейство, токен, ожидание)`.
+/// Токен в `{фигурных скобках}` набран не в той раскладке и ожидает переключения.
+///
+/// Здесь Tier 0 намеренно оценивается вне контекста — он контекста и не видит.
+/// Смысл замера в том, чтобы показать, сколько именно он теряет там, где решение
+/// без окружения невозможно: это и есть бюджет, который может отыграть Tier 1.
+fn read_context_cases(path: &Path) -> Vec<(String, String, Decision)> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut cases = Vec::new();
+    let mut family = String::from("(без семейства)");
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(header) = trimmed.strip_prefix("# --- ") {
+            // «A. Русская фраза ... ---» -> «A»
+            family = header
+                .split('.')
+                .next()
+                .unwrap_or(header)
+                .trim()
+                .to_string();
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
+
+        for raw in trimmed.split_whitespace() {
+            match raw.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+                Some(token) => {
+                    cases.push((family.clone(), token.to_string(), Decision::Switch))
+                }
+                None => cases.push((family.clone(), raw.to_string(), Decision::Keep)),
+            }
+        }
+    }
+    cases
+}
+
 fn percentile(sorted_nanos: &[u128], p: f64) -> u128 {
     if sorted_nanos.is_empty() {
         return 0;
@@ -338,6 +386,59 @@ fn main() {
         short.fp + short.fn_
     );
     println!();
+
+    // Контекстный подкорпус: та же модель, но на предложениях, размеченных вручную.
+    let context_cases = read_context_cases(&corpus.join("context").join("cases.txt"));
+    if !context_cases.is_empty() {
+        let mut per_family: HashMap<String, Counts> = HashMap::new();
+        let mut ctx_overall = Counts::default();
+        let mut ctx_errors: Vec<(&str, &str, Decision)> = Vec::new();
+
+        for (family, token, expected) in &context_cases {
+            let got = tier0.decide(token);
+            ctx_overall.record(*expected, got);
+            per_family
+                .entry(family.clone())
+                .or_default()
+                .record(*expected, got);
+            if got != *expected {
+                ctx_errors.push((family, token, *expected));
+            }
+        }
+
+        println!("## Контекстный подкорпус\n");
+        println!(
+            "{} токенов, precision {:.4}, recall {:.4}, FP {}, FN {}\n",
+            ctx_overall.total(),
+            ctx_overall.precision(),
+            ctx_overall.recall(),
+            ctx_overall.fp,
+            ctx_overall.fn_
+        );
+
+        println!("| Семейство | Токенов | FP | FN | Доля верных |");
+        println!("|---|---|---|---|---|");
+        let mut families: Vec<&String> = per_family.keys().collect();
+        families.sort();
+        for f in families {
+            let c = &per_family[f];
+            let acc = 1.0 - (c.fp + c.fn_) as f64 / c.total() as f64;
+            println!("| {} | {} | {} | {} | {:.4} |", f, c.total(), c.fp, c.fn_, acc);
+        }
+        println!();
+
+        // Список ошибок печатается целиком: их немного, и каждая — конкретный
+        // случай, который должен либо чиниться, либо осознанно приниматься.
+        println!("Ошибки ({}):\n", ctx_errors.len());
+        for (family, token, expected) in &ctx_errors {
+            let what = match expected {
+                Decision::Switch => "не переключил",
+                Decision::Keep => "ЛОЖНОЕ переключение",
+            };
+            println!("- [{family}] {token} — {what}");
+        }
+        println!();
+    }
 
     // Развёртка по порогу: рабочая точка выбирается под асимметричную стоимость
     // ошибок (ADR-0001), поэтому важна не одна цифра, а форма кривой.
