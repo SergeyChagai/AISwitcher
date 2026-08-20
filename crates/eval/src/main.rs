@@ -112,7 +112,16 @@ impl Counts {
     }
 }
 
+/// Потолок на подкорпус живой речи. OpenSubtitles даёт миллионы токенов, но
+/// n-граммная модель насыщается задолго до этого, а счётчики в HashMap растут
+/// линейно. Ограничение держит прогон в секундах.
+const SPEECH_TOKEN_LIMIT: usize = 400_000;
+
 fn read_dir_tokens(dir: &Path) -> Vec<String> {
+    read_dir_tokens_limited(dir, usize::MAX)
+}
+
+fn read_dir_tokens_limited(dir: &Path, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -126,7 +135,14 @@ fn read_dir_tokens(dir: &Path) -> Vec<String> {
         // Ошибка чтения не глотается: битая кодировка иначе выглядит как пустой
         // корпус, и замер молча считает не то, что кажется.
         match std::fs::read_to_string(&path) {
-            Ok(text) => out.extend(ngram::tokenize(&text)),
+            Ok(text) => {
+                for token in ngram::tokenize(&text) {
+                    if out.len() >= limit {
+                        return out;
+                    }
+                    out.push(token);
+                }
+            }
             Err(e) => {
                 eprintln!("не прочитан {}: {e}", path.display());
                 std::process::exit(1);
@@ -196,6 +212,9 @@ fn main() {
     let corpus = root.join("corpus");
 
     let ru_tokens = read_dir_tokens(&corpus.join("ru"));
+    // Живая речь: субтитры из OPUS. Каталог необязателен — если корпус не скачан
+    // (tools/fetch-opensubtitles.sh), замер просто идёт без этого подкорпуса.
+    let speech_tokens = read_dir_tokens_limited(&corpus.join("ru-speech"), SPEECH_TOKEN_LIMIT);
     let en_tokens = read_dir_tokens(&corpus.join("en"));
     let tech_tokens = read_dir_tokens(&corpus.join("tech"));
     let terminal_tokens = read_dir_tokens(&corpus.join("terminal"));
@@ -210,8 +229,11 @@ fn main() {
     let (tech_train, tech_test) = split(&tech_tokens);
     let (term_train, term_test) = split(&terminal_tokens);
 
+    let (speech_train, speech_test) = split(&speech_tokens);
+
     let mut ru = CharNgram::new();
     ru.train(&ru_train.join(" "));
+    ru.train(&speech_train.join(" "));
 
     // Модель «текста в EN-раскладке» обучается и на техническом тексте: npm, ls,
     // пути и идентификаторы набираются в этой раскладке и переключать их не нужно.
@@ -238,6 +260,12 @@ fn main() {
         cases.push(("en-clean", t.clone(), Decision::Keep));
         if let Some(m) = transliterate(t, Direction::EnToRu) {
             cases.push(("mistyped-en", m, Decision::Switch));
+        }
+    }
+    for t in &speech_test {
+        cases.push(("ru-speech", t.clone(), Decision::Keep));
+        if let Some(m) = transliterate(t, Direction::RuToEn) {
+            cases.push(("mistyped-speech", m, Decision::Switch));
         }
     }
     for t in &tech_test {
@@ -268,8 +296,9 @@ fn main() {
 
     println!("# Baseline Tier 0 — результаты\n");
     println!(
-        "Обучение: ru={} ток., en={} ток., tech={} ток., terminal={} ток.",
+        "Обучение: ru={} ток., ru-speech={} ток., en={} ток., tech={} ток., terminal={} ток.",
         ru_train.len(),
+        speech_train.len(),
         en_train.len(),
         tech_train.len(),
         term_train.len()

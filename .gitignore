@@ -7,3 +7,6 @@ dist/
 
 # Rust
 target/
+
+# Скачанные внешние корпуса: воспроизводятся tools/fetch-*.sh, в репозиторий не идут
+corpus/ru-speech/
