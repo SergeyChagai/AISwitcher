@@ -1,0 +1,115 @@
+git status
+git add .
+git commit -m fix
+git push origin main
+git pull --rebase
+git checkout -b feature
+git log --oneline
+git diff HEAD
+git stash pop
+git rebase main
+git merge --no-ff
+git remote -v
+git fetch --all
+git reset --hard
+git cherry-pick
+git branch -d old
+git tag -a v1
+git clone https url
+git blame src
+git bisect start
+npm install
+npm run dev
+npm run build
+npm run test
+npm ci
+npm publish
+npx create app
+pnpm install
+pnpm add dep
+pnpm dlx
+yarn install
+yarn build
+cargo build
+cargo build --release
+cargo test
+cargo run
+cargo check
+cargo clippy
+cargo fmt
+cargo add serde
+cargo update
+cargo bench
+cargo doc --open
+rustup update
+rustup target add
+dotnet build
+dotnet run
+dotnet test
+dotnet restore
+dotnet publish
+dotnet new console
+docker build -t app
+docker run -it
+docker ps -a
+docker compose up
+docker exec bash
+docker logs -f
+docker image prune
+kubectl get pods
+kubectl apply -f
+kubectl logs
+kubectl describe pod
+ls -la
+cd src
+pwd
+mkdir -p build
+rm -rf node_modules
+cp src dst
+mv old new
+cat README
+head -n 20
+tail -f log
+grep -rn pattern
+find . -name
+sed -i s
+awk print
+sort uniq
+wc -l
+chmod +x
+curl -sS url
+wget url
+ssh user host
+scp file host
+tar -xzf archive
+zip -r out
+ping host
+netstat -an
+ps aux
+kill -9
+top
+df -h
+du -sh
+export PATH
+source env
+which python
+echo hello
+touch file
+ln -s target link
+diff a b
+less file
+nano file
+vim file
+code .
+make build
+make clean
+cmake ..
+python -m venv
+pip install
+pip freeze
+node index js
+tsc --watch
+eslint src
+prettier --write
+vitest run
+jest --coverage
