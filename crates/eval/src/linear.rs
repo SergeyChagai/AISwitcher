@@ -79,6 +79,12 @@ impl LinearModel {
         }
     }
 
+    /// Скорость обучения меняется при переходе от поставочного обучения к
+    /// персональному: там она ниже намеренно (ADR-0005, решение 3).
+    pub fn set_learning_rate(&mut self, lr: f64) {
+        self.lr = lr;
+    }
+
     pub fn weights(&self) -> &Features {
         &self.weights
     }

@@ -957,6 +957,166 @@ fn main() {
         }
         println!();
 
+        // --- Метрики персонализации (ADR-0005) ---
+        //
+        // Симуляция: поставочная модель обучена на всём, кроме потока этого
+        // пользователя. Поток подаётся по одному предложению; на каждой ошибке
+        // вносится правка — ровно тот же вызов update, что и при отмене вживую.
+        //
+        // Правки вносятся только на ложных срабатываниях. Это не упрощение, а
+        // воспроизведение реальности: отмена сигналит о лишнем переключении,
+        // о пропуске она молчит (см. таблицу сигналов в ADR-0005).
+        println!("## Персонализация: кривая обучения (ADR-0005)\n");
+
+        // Два потока пользователя, и разница между ними — суть замера.
+        //
+        // Сбалансированный: все предложения E и H. В нём каждая коллизия встречается
+        // ОБА раза, в обоих прочтениях. Такой пользователь неперсонализируем по
+        // определению: он сам употребляет `руку` и как руку, и как `here`.
+        //
+        // Смещённый: только те предложения, где коллизия набрана не в той раскладке.
+        // Это человек, который пишет в одном регистре — верстальщик, а не биолог.
+        // Персонализация имеет смысл только для него, и проверять надо на нём.
+        let balanced: Vec<usize> = context_cases
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.family == "E" || s.family == "H")
+            .map(|(i, _)| i)
+            .collect();
+        let biased: Vec<usize> = balanced
+            .iter()
+            .copied()
+            .filter(|i| {
+                context_cases[*i]
+                    .tokens
+                    .iter()
+                    .any(|(_, d)| *d == Decision::Switch)
+            })
+            .collect();
+
+
+        let shipped_data: Vec<(Features, bool)> = per_sentence
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !balanced.contains(i))
+            .flat_map(|(_, rows)| rows.iter().map(|(x, y, _)| (*x, *y)))
+            .collect();
+
+        let mut shipped = LinearModel::new(0.05, 0.001);
+        shipped.train(&shipped_data, 60);
+
+        println!(
+            "Поставочная модель обучена без E и H. Потоки: сбалансированный {}, смещённый {} предл.\n",
+            balanced.len(),
+            biased.len()
+        );
+        println!("| поток | порог | сигнал | правок | ошибок 1/3 | ошибок 3/3 | регрессия |");
+        println!("|---|---|---|---|---|---|---|");
+
+        // `use_miss_signal` — учитывать ли пропуски. Сигнал о пропуске — ручное
+        // переключение раскладки — грязный: то же действие означает обычную
+        // смену языка. Поэтому он проверяется отдельно, а не включён по умолчанию.
+        for (stream_name, stream) in [("сбаланс.", &balanced), ("смещённый", &biased)] {
+        for threshold in [0.5, 0.7] {
+            for (use_miss_signal, token_memory) in
+                [(false, false), (true, false), (true, true)]
+            {
+                // Скорость персонального обучения ниже поставочной: одна случайная
+                // отмена не должна ломать поведение (ADR-0005, решение 3).
+                let mut personal = shipped.clone();
+                personal.set_learning_rate(0.02);
+
+                let mut errors_per_sentence: Vec<usize> = Vec::new();
+                let mut corrections = 0usize;
+                // Пословная память: «этот человек на этом токене имел в виду вот это».
+                // Линейная модель над общими признаками такого запомнить не может —
+                // у двух вхождений одного токена признаки почти совпадают.
+                let mut memory: HashMap<String, f64> = HashMap::new();
+
+                for &idx in stream {
+                    let mut errors = 0usize;
+                    for (i, (x, label, escalates)) in per_sentence[idx].iter().enumerate() {
+                        if !*escalates {
+                            continue;
+                        }
+                        let token = context_cases[idx].tokens[i].0.to_lowercase();
+                        let bias = if token_memory {
+                            *memory.get(&token).unwrap_or(&0.0)
+                        } else {
+                            0.0
+                        };
+                        let predicted = personal.probability(x) + bias > threshold;
+                        if predicted == *label {
+                            continue;
+                        }
+                        errors += 1;
+                        if token_memory {
+                            let target = if *label { 1.0 } else { -1.0 };
+                            *memory.entry(token).or_insert(0.0) += 0.5 * target;
+                        }
+
+                        let signalled = if predicted {
+                            true // переключили лишнее: пользователь жмёт отмену
+                        } else {
+                            use_miss_signal // пропустили: сигнал есть, но грязный
+                        };
+                        if signalled {
+                            personal.update(x, *label);
+                            corrections += 1;
+                        }
+                    }
+                    errors_per_sentence.push(errors);
+                }
+
+                let third = (errors_per_sentence.len() / 3).max(1);
+                let sum = |r: &[usize]| r.iter().sum::<usize>();
+                let first = sum(&errors_per_sentence[..third]);
+                let last = sum(&errors_per_sentence[errors_per_sentence.len() - third..]);
+
+                // Регрессия: не сломала ли персонализация то, что работало у всех.
+                let mut before = Counts::default();
+                let mut after = Counts::default();
+                for (i, rows) in per_sentence.iter().enumerate() {
+                    if stream.contains(&i) {
+                        continue;
+                    }
+                    for (x, label, escalates) in rows {
+                        if !*escalates {
+                            continue;
+                        }
+                        let expected = if *label { Decision::Switch } else { Decision::Keep };
+                        let d = |m: &LinearModel| {
+                            if m.probability(x) > threshold {
+                                Decision::Switch
+                            } else {
+                                Decision::Keep
+                            }
+                        };
+                        before.record(expected, d(&shipped));
+                        after.record(expected, d(&personal));
+                    }
+                }
+
+                println!(
+                    "| {} | {:.2} | {} | {} | {} | {} | {} → {} |",
+                    stream_name,
+                    threshold,
+                    match (use_miss_signal, token_memory) {
+                        (false, _) => "только отмена",
+                        (true, false) => "отмена + пропуск",
+                        (true, true) => "+ пословная память",
+                    },
+                    corrections,
+                    first,
+                    last,
+                    before.fp + before.fn_,
+                    after.fp + after.fn_
+                );
+            }
+        }
+        }
+        println!();
+
         println!("Ошибки ({}):\n", ctx_errors.len());
         for (family, token, expected) in &ctx_errors {
             let what = match expected {
