@@ -957,6 +957,51 @@ fn main() {
         }
         println!();
 
+        // --- Третий исход: спросить пользователя ---
+        //
+        // Спрашивать имеет смысл там, где модель по-настоящему не уверена, то есть
+        // вероятность близка к 0.5. Вопрос даёт чистый размеченный пример в обе
+        // стороны — в отличие от отмены, которая сигналит только о лишнем
+        // переключении. Плата — прерывание, поэтому вопрос ценен ровно настолько,
+        // насколько он редок.
+        println!("## Третий исход: спросить пользователя\n");
+        println!("| полоса вокруг 0.5 | вопросов | доля токенов | ошибок снято | ошибок осталось |");
+        println!("|---|---|---|---|---|");
+
+        let total_scored = scored.len();
+        for half_width in [0.05, 0.10, 0.15, 0.20, 0.30] {
+            let (lo, hi) = (0.5 - half_width, 0.5 + half_width);
+            let mut asked = 0usize;
+            let mut resolved = 0usize;
+            let mut remaining = 0usize;
+
+            for (p, label, _, _) in &scored {
+                let expected = if *label { Decision::Switch } else { Decision::Keep };
+                if *p > lo && *p < hi {
+                    asked += 1;
+                    // Вопрос снимает ошибку: пользователь отвечает верно по определению.
+                    if (*p > 0.70) != *label {
+                        resolved += 1;
+                    }
+                    continue;
+                }
+                let got = if *p > 0.70 { Decision::Switch } else { Decision::Keep };
+                if got != expected {
+                    remaining += 1;
+                }
+            }
+
+            println!(
+                "| ±{:.2} | {} | {:.1}% | {} | {} |",
+                half_width,
+                asked,
+                100.0 * asked as f64 / total_scored as f64,
+                resolved,
+                remaining
+            );
+        }
+        println!();
+
         // --- Метрики персонализации (ADR-0005) ---
         //
         // Симуляция: поставочная модель обучена на всём, кроме потока этого
