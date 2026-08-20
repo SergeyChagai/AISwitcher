@@ -12,8 +12,37 @@ use std::time::Instant;
 use layout_map::{detect_direction, transliterate, Direction};
 use ngram::CharNgram;
 
+mod linear;
 mod register;
+use linear::{Features, LinearModel, FEATURE_COUNT, FEATURE_NAMES};
 use register::RegisterModel;
+
+/// Признаки для линейной модели. Все берутся у Tier 0, который их уже посчитал,
+/// поэтому вызов Tier 1 почти ничего не стоит.
+fn features(
+    token: &str,
+    a: &Analysis,
+    neighbour_switched: bool,
+    register_score: Option<f64>,
+    first_in_sentence: bool,
+) -> Features {
+    let len = token.chars().count();
+    let all_caps = token.chars().any(|c| c.is_alphabetic())
+        && token.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase());
+    let capitalized = token.chars().next().is_some_and(|c| c.is_uppercase());
+
+    [
+        1.0,
+        (a.diff / 5.0).clamp(-2.0, 2.0),
+        ((a.diff - a.required) / 5.0).clamp(-2.0, 2.0),
+        (len as f64 / 10.0).min(2.0),
+        if len <= 3 { 1.0 } else { 0.0 },
+        if all_caps { 1.0 } else { 0.0 },
+        if neighbour_switched { 1.0 } else { 0.0 },
+        register_score.unwrap_or(0.0).clamp(-2.0, 2.0),
+        if capitalized && !first_in_sentence { 1.0 } else { 0.0 },
+    ]
+}
 
 /// Вес признака регистра текста при вызове Tier 1. Подбирается развёрткой.
 const REGISTER_WEIGHT: f64 = 1.0;
@@ -775,6 +804,156 @@ fn main() {
                 c.fn_,
                 used
             );
+        }
+        println!();
+
+        // --- Кандидат Tier 1 №2: линейная модель над признаками Tier 0 ---
+        //
+        // Оценка — перекрёстная проверка с исключением по одному предложению.
+        // Обычный случайный сплит здесь дал бы утечку: предложения идут парами
+        // (одно чтение токена в keep, другое в switch), и разнести пару по разные
+        // стороны значит показать модели ответ.
+        //
+        // Модель применяется только к поднятым решениям; остальные остаются за Tier 0.
+        let build = |sentence: &Sentence| -> Vec<(Features, bool, bool)> {
+            let analyses: Vec<Analysis> = sentence
+                .tokens
+                .iter()
+                .map(|(t, _)| tier0.analyze(t, tier0.margin))
+                .collect();
+            let base: Vec<Decision> = analyses.iter().map(|a| a.decision()).collect();
+
+            sentence
+                .tokens
+                .iter()
+                .enumerate()
+                .map(|(i, (token, expected))| {
+                    let neighbour = [i.checked_sub(1), i.checked_add(1)]
+                        .into_iter()
+                        .flatten()
+                        .any(|j| j < base.len() && base[j] == Decision::Switch);
+                    let context: Vec<String> = sentence
+                        .tokens
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != i && !analyses[*j].escalates())
+                        .map(|(_, (t, _))| t.to_lowercase())
+                        .filter(|t| t.chars().all(layout_map::is_cyrillic))
+                        .collect();
+                    let x = features(
+                        token,
+                        &analyses[i],
+                        neighbour,
+                        register.context_score(&context),
+                        i == 0,
+                    );
+                    (x, *expected == Decision::Switch, analyses[i].escalates())
+                })
+                .collect()
+        };
+
+        let per_sentence: Vec<Vec<(Features, bool, bool)>> =
+            context_cases.iter().map(build).collect();
+
+        // Вероятности собираются один раз, пороги перебираются по ним: переобучать
+        // 105 фолдов на каждый порог незачем.
+        let mut scored: Vec<(f64, bool, bool, String)> = Vec::new();
+        for held_out in 0..per_sentence.len() {
+            let train: Vec<(Features, bool)> = per_sentence
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != held_out)
+                .flat_map(|(_, rows)| rows.iter().map(|(x, y, _)| (*x, *y)))
+                .collect();
+
+            let mut model = LinearModel::new(0.05, 0.001);
+            model.train(&train, 60);
+
+            for (i, (x, label, escalates)) in per_sentence[held_out].iter().enumerate() {
+                let fallback = tier0
+                    .analyze(&context_cases[held_out].tokens[i].0, tier0.margin)
+                    .decision();
+                let p = if *escalates {
+                    model.probability(x)
+                } else if fallback == Decision::Switch {
+                    // Не поднятое решение порогом не управляется: кодируем его
+                    // как заведомо уверенное, чтобы оно не двигалось развёрткой.
+                    1.0
+                } else {
+                    0.0
+                };
+                scored.push((p, *label, *escalates, context_cases[held_out].family.clone()));
+            }
+        }
+
+        println!("## Кандидат Tier 1: линейная модель над признаками Tier 0\n");
+        println!(
+            "Перекрёстная проверка с исключением по одному предложению, {} фолдов.\n",
+            per_sentence.len()
+        );
+
+        println!("| порог | Precision | Recall | FP | FN |");
+        println!("|---|---|---|---|---|");
+        for threshold in [0.3, 0.5, 0.7, 0.8, 0.9, 0.95] {
+            let mut c = Counts::default();
+            for (p, label, _, _) in &scored {
+                let expected = if *label { Decision::Switch } else { Decision::Keep };
+                let got = if *p > threshold {
+                    Decision::Switch
+                } else {
+                    Decision::Keep
+                };
+                c.record(expected, got);
+            }
+            println!(
+                "| {:.2} | {:.4} | {:.4} | {} | {} |",
+                threshold,
+                c.precision(),
+                c.recall(),
+                c.fp,
+                c.fn_
+            );
+        }
+        println!();
+
+        let mut lin = Counts::default();
+        let mut lin_family: HashMap<String, Counts> = HashMap::new();
+        for (p, label, _, family) in &scored {
+            let expected = if *label { Decision::Switch } else { Decision::Keep };
+            let got = if *p > 0.5 { Decision::Switch } else { Decision::Keep };
+            lin.record(expected, got);
+            lin_family.entry(family.clone()).or_default().record(expected, got);
+        }
+        println!("По семействам при пороге 0.5:\n");
+        println!("| Семейство | FP | FN |");
+        println!("|---|---|---|");
+        let mut names: Vec<&String> = lin_family.keys().collect();
+        names.sort();
+        for f in names {
+            let c = &lin_family[f];
+            println!("| {} | {} | {} |", f, c.fp, c.fn_);
+        }
+        println!();
+
+        // Веса модели, обученной на всём корпусе: они показывают, чему она научилась.
+        let all: Vec<(Features, bool)> = per_sentence
+            .iter()
+            .flat_map(|rows| rows.iter().map(|(x, y, _)| (*x, *y)))
+            .collect();
+        let mut full = LinearModel::new(0.05, 0.001);
+        full.train(&all, 60);
+
+        println!("| Признак | Вес |");
+        println!("|---|---|");
+        let mut order: Vec<usize> = (0..FEATURE_COUNT).collect();
+        order.sort_by(|a, b| {
+            full.weights()[*b]
+                .abs()
+                .partial_cmp(&full.weights()[*a].abs())
+                .unwrap()
+        });
+        for i in order {
+            println!("| {} | {:+.3} |", FEATURE_NAMES[i], full.weights()[i]);
         }
         println!();
 
